@@ -2,11 +2,16 @@ import os
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
+import requests
+from duckduckgo_search import DDGS
+import json
+import re
 
 BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 LORA_PATH = "./silas_lora_final"
 
-SUMMARY_FILE = "memory.txt"
+MEMORY_FILE = "memory.txt"
+SUMMARY_FILE = "memory_summary.txt"
 RECENT_WINDOW = 20   
 SUMMARIZE_EVERY = 30   
 
@@ -16,6 +21,64 @@ SYSTEM_PROMPT = (
     "Keep replies short and conversational, suitable for being spoken aloud. "
     "You will only refer to the user as Master Kershaw."
 )
+
+def tool_web_search(query, max_results=4):
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return "No results found."
+        return "\n\n".join(f"{r['title']}: {r['body']}\nSource: {r['href']}" for r in results)
+    except Exception as e:
+        return f"Search failed: {e}"
+
+def tool_fetch_url(url):
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        text = resp.text
+        import re
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:3000]  
+    except Exception as e:
+        return f"Fetch failed: {e}"
+
+AVAILABLE_TOOLS = {
+    "web_search": tool_web_search,
+    "fetch_url": tool_fetch_url,
+}
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information, news, facts, or anything not known ahead of time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch and read the text content of a specific web page URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The full URL to fetch"}
+                },
+                "required": ["url"],
+            },
+        },
+    },
+]
 
 class SilasModel:
     def __init__(self):
@@ -68,8 +131,7 @@ class SilasModel:
             f.write(summary)
 
     def summarize_old_history(self):
-        # Everything except the most recent RECENT_WINDOW messages gets folded into the summary
-        old_messages = self.chat_history[1:-RECENT_WINDOW]  # skip system prompt, skip recent
+        old_messages = self.chat_history[1:-RECENT_WINDOW]  
         if not old_messages:
             return
 
@@ -102,13 +164,11 @@ class SilasModel:
 
         self.save_summary(new_summary)
 
-        # Trim in-memory history, but memory.txt on disk keeps everything, untouched
         self.chat_history = [self.chat_history[0]] + self.chat_history[-RECENT_WINDOW:]
 
-
-    def chat(self, prompt, max_new_tokens=80):
+    def chat(self, prompt, max_new_tokens=300):
         self.chat_history.append({"role": "user", "content": prompt})
-        self.mem(f"user: {prompt}")  # full history always saved to memory.txt, never trimmed on disk
+        self.mem(f"user: {prompt}")
 
         summary = self.load_summary()
         system_content = SYSTEM_PROMPT
@@ -117,32 +177,62 @@ class SilasModel:
 
         context = [{"role": "system", "content": system_content}] + self.chat_history[-RECENT_WINDOW:]
 
-        formatted_prompt = self.tokenizer.apply_chat_template(
-            context, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(formatted_prompt, return_tensors="pt").to(self.model.device)
-
-        with torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.9,
-                pad_token_id=self.tokenizer.eos_token_id,
+        for _ in range(3):
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                context, tools=TOOLS_SCHEMA, tokenize=False, add_generation_prompt=True
             )
+            inputs = self.tokenizer(formatted_prompt, return_tensors="pt").to(self.model.device)
 
-        reply = self.tokenizer.decode(
-            output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        ).strip()
+            with torch.no_grad():
+                output = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.7,
+                    do_sample=True,
+                    top_p=0.9,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
 
-        self.chat_history.append({"role": "assistant", "content": reply})
-        self.mem(f"silas: {reply}")
+            raw_reply = self.tokenizer.decode(
+                output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+            ).strip()
 
-        if len(self.chat_history) > SUMMARIZE_EVERY:
-            self.summarize_old_history()
+            tool_call = self._extract_tool_call(raw_reply)
 
-        return reply
+            if tool_call is None:
+                self.chat_history.append({"role": "assistant", "content": raw_reply})
+                self.mem(f"silas: {raw_reply}")
+
+                if len(self.chat_history) > SUMMARIZE_EVERY:
+                    self.summarize_old_history()
+
+                return raw_reply
+            
+            tool_name = tool_call["name"]
+            tool_args = tool_call.get("arguments", {})
+            print(f">>> Silas is calling tool: {tool_name}({tool_args})")
+
+            if tool_name in AVAILABLE_TOOLS:
+                tool_result = AVAILABLE_TOOLS[tool_name](**tool_args)
+            else:
+                tool_result = f"Unknown tool: {tool_name}"
+
+            context.append({"role": "assistant", "content": raw_reply})
+            context.append({"role": "tool", "name": tool_name, "content": tool_result})
+
+        fallback = "I wasn't able to finish looking that up properly, Master Kershaw."
+        self.chat_history.append({"role": "assistant", "content": fallback})
+        self.mem(f"silas: {fallback}")
+        return fallback
+
+    def _extract_tool_call(self, text):
+        match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
 
 if __name__ == "__main__":
     silas = SilasModel()
