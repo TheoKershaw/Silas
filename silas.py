@@ -1,19 +1,18 @@
 import os
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import PeftModel
-import requests
-from duckduckgo_search import DDGS
 import json
 import re
+import requests
+from duckduckgo_search import DDGS
+import ollama
+import time
 
-BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-LORA_PATH = "./silas_lora_final"
+# ---- Config ----
+# Run `ollama pull qwen2.5:7b` (or any model you like) before running this script.
+OLLAMA_MODEL = "qwen2.5:7b"
 
-MEMORY_FILE = "memory.txt"
-SUMMARY_FILE = "memory_summary.txt"
-RECENT_WINDOW = 20   
-SUMMARIZE_EVERY = 30   
+SUMMARY_FILE = "memory.txt"
+RECENT_WINDOW = 20
+SUMMARIZE_EVERY = 30
 
 SYSTEM_PROMPT = (
     "You are Silas, an AI assistant created by Theo Kershaw. "
@@ -21,6 +20,8 @@ SYSTEM_PROMPT = (
     "Keep replies short and conversational, suitable for being spoken aloud. "
     "You will only refer to the user as Master Kershaw."
 )
+
+# ---- Tools ----
 
 def tool_web_search(query, max_results=4):
     try:
@@ -37,10 +38,9 @@ def tool_fetch_url(url):
         resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         text = resp.text
-        import re
         text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
-        return text[:3000]  
+        return text[:3000]
     except Exception as e:
         return f"Fetch failed: {e}"
 
@@ -80,26 +80,11 @@ TOOLS_SCHEMA = [
     },
 ]
 
+
 class SilasModel:
     def __init__(self):
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-
-        print("Loading base model...")
-        self.tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
-        base_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-
-        print("Loading Silas LoRA adapter...")
-        self.model = PeftModel.from_pretrained(base_model, LORA_PATH)
-        self.model.eval()
+        print(f"Using Ollama model: {OLLAMA_MODEL}")
+        print("(Make sure `ollama serve` is running and you've run `ollama pull {}` at least once)".format(OLLAMA_MODEL))
 
         self.chat_history = [{"role": "system", "content": SYSTEM_PROMPT}] + self.load_memory()
         print("Silas model ready.")
@@ -131,7 +116,7 @@ class SilasModel:
             f.write(summary)
 
     def summarize_old_history(self):
-        old_messages = self.chat_history[1:-RECENT_WINDOW]  
+        old_messages = self.chat_history[1:-RECENT_WINDOW]
         if not old_messages:
             return
 
@@ -146,21 +131,12 @@ class SilasModel:
             {"role": "user", "content": f"Existing summary:\n{existing_summary}\n\nNew conversation to fold in:\n{transcript}"}
         ]
 
-        formatted = self.tokenizer.apply_chat_template(summarize_prompt, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
-
-        with torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=150,
-                temperature=0.3,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-
-        new_summary = self.tokenizer.decode(
-            output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-        ).strip()
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=summarize_prompt,
+            options={"temperature": 0.3, "num_predict": 150},
+        )
+        new_summary = response["message"]["content"].strip()
 
         self.save_summary(new_summary)
 
@@ -177,29 +153,27 @@ class SilasModel:
 
         context = [{"role": "system", "content": system_content}] + self.chat_history[-RECENT_WINDOW:]
 
-        for _ in range(3):
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                context, tools=TOOLS_SCHEMA, tokenize=False, add_generation_prompt=True
+        for attempt in range(3):
+            gen_tokens = 80 if attempt < 2 else max_new_tokens
+
+            start = time.time()
+            response = ollama.chat(
+                model=OLLAMA_MODEL,
+                messages=context,
+                tools=TOOLS_SCHEMA,
+                options={"temperature": 0.7, "top_p": 0.9, "num_predict": gen_tokens},
             )
-            inputs = self.tokenizer(formatted_prompt, return_tensors="pt").to(self.model.device)
+            elapsed = time.time() - start
 
-            with torch.no_grad():
-                output = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    temperature=0.7,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
+            message = response["message"]
+            tool_calls = message.get("tool_calls")
 
-            raw_reply = self.tokenizer.decode(
-                output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-            ).strip()
+            eval_count = response.get("eval_count", 0)
+            tok_per_sec = eval_count / elapsed if elapsed > 0 else 0
+            print(f">>> Generated {eval_count} tokens in {elapsed:.1f}s ({tok_per_sec:.1f} tok/s)")
 
-            tool_call = self._extract_tool_call(raw_reply)
-
-            if tool_call is None:
+            if not tool_calls:
+                raw_reply = message["content"].strip()
                 self.chat_history.append({"role": "assistant", "content": raw_reply})
                 self.mem(f"silas: {raw_reply}")
 
@@ -207,32 +181,27 @@ class SilasModel:
                     self.summarize_old_history()
 
                 return raw_reply
-            
-            tool_name = tool_call["name"]
-            tool_args = tool_call.get("arguments", {})
-            print(f">>> Silas is calling tool: {tool_name}({tool_args})")
 
-            if tool_name in AVAILABLE_TOOLS:
-                tool_result = AVAILABLE_TOOLS[tool_name](**tool_args)
-            else:
-                tool_result = f"Unknown tool: {tool_name}"
+            # Handle tool call(s) - Ollama returns structured tool_calls, no manual parsing needed
+            context.append(message)
 
-            context.append({"role": "assistant", "content": raw_reply})
-            context.append({"role": "tool", "name": tool_name, "content": tool_result})
+            for call in tool_calls:
+                tool_name = call["function"]["name"]
+                tool_args = call["function"].get("arguments", {})
+                print(f">>> Silas is calling tool: {tool_name}({tool_args})")
+
+                if tool_name in AVAILABLE_TOOLS:
+                    tool_result = AVAILABLE_TOOLS[tool_name](**tool_args)
+                else:
+                    tool_result = f"Unknown tool: {tool_name}"
+
+                context.append({"role": "tool", "content": tool_result})
 
         fallback = "I wasn't able to finish looking that up properly, Master Kershaw."
         self.chat_history.append({"role": "assistant", "content": fallback})
         self.mem(f"silas: {fallback}")
         return fallback
 
-    def _extract_tool_call(self, text):
-        match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
-        if not match:
-            return None
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            return None
 
 if __name__ == "__main__":
     silas = SilasModel()
