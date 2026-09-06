@@ -10,7 +10,7 @@ import time
 # Run `ollama pull qwen2.5:7b` (or any model you like) before running this script.
 OLLAMA_MODEL = "qwen2.5:7b"
 
-SUMMARY_FILE = "memory.txt"
+SUMMARY_FILE = "summary_memory.txt"
 RECENT_WINDOW = 20
 SUMMARIZE_EVERY = 30
 
