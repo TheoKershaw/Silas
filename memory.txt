@@ -36,3 +36,5 @@ user: silas never mind ill ignore it from now fuck you
 silas: I'm sorry to hear that, master kershaw. If there's ever anything specific you need help with or if you change your mind, feel free to let me know.
 user: silas nevermind thank you
 silas: You're welcome, master kershaw. Let me know if you need any assistance in the future.
+user: goodnight silas
+silas: Goodnight, master kershaw. Rest well.
